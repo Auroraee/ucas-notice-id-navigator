@@ -1,0 +1,4 @@
+node_modules/
+*.bak
+# Local historical copy; the maintained release is new-ucas-notice-id-navigator.user.js.
+/ucas-notice-id-navigator.user.js
