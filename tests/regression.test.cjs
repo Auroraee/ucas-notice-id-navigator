@@ -7,6 +7,7 @@ const { JSDOM } = require('jsdom');
 const FakeTimers = require('@sinonjs/fake-timers');
 
 const source = fs.readFileSync(path.join(__dirname, '..', 'new-ucas-notice-id-navigator.user.js'), 'utf8');
+const mcBodyNotice = fs.readFileSync(path.join(__dirname, 'fixtures', 'mc-body-notice.html'), 'utf8');
 const exportsForTest = [
   'bootstrap', 'state', 'scheduler', 'makePolicy', 'defaultConfig', 'loadConfig', 'loadCache',
   'makeEntry', 'mergeEntry', 'persistCache', 'needsFetch', 'retryIds', 'parseNoticeDoc',
@@ -152,6 +153,60 @@ test('parser retains body headings and selects labeled publication date only', t
   assert.equal(invalid.date, '');
 });
 
+test('UCAS mc-body template yields its exact h3 title and full adjacent body', t => {
+  const { a, doc } = setup(t);
+  const longHtml = mcBodyNotice.replace('全文末尾测试关键词', '中间正文内容。'.repeat(150) + '全文末尾测试关键词');
+  const p = a.parseNoticeDoc(doc(longHtml));
+  assert.equal(p.title, '中国科学院大学2025-2026学年秋季学期研究生课程网络选课说明');
+  assert.equal(p.bodyReady, true);
+  assert.ok(p.bodyText.length > 900);
+  assert.match(p.bodyText, /正文内的小标题/);
+  assert.match(p.bodyText, /跨学科兼修/);
+  assert.doesNotMatch(p.bodyText, /页头导航|页脚导航|测试附件文件名|查看通知-选课系统/);
+  assert.equal(p.date, '', 'course and signature dates are not explicit publication metadata');
+  const arbitraryTitle = mcBodyNotice.replace(/<h3>[^<]+<\/h3>/, '<h3>研究生课程跨学科兼修</h3>');
+  assert.equal(a.parseNoticeDoc(doc(arbitraryTitle)).title, '研究生课程跨学科兼修');
+});
+
+test('empty or loading mc-body content cannot use attachment filenames as full text', t => {
+  const { a, doc } = setup(t);
+  for (const body of ['', '<div></div>', '<div aria-busy="true">正在加载中</div>']) {
+    const p = a.parseNoticeDoc(doc(`<title>查看通知-选课系统</title>
+      <div class="m-cbox"><div class="mc-body"><h3>研究生课程网络选课说明</h3>${body}
+      <div id="existsfiles"><a href="/notice/file/1/file.pdf">附件名称与内容提示</a></div></div></div>`));
+    assert.equal(p.title, '研究生课程网络选课说明');
+    assert.equal(p.bodyReady, false);
+    assert.doesNotMatch(p.bodyText, /附件名称/);
+  }
+});
+
+test('mc-body title and tail keywords work through HTTP, iframe and restored cache', async t => {
+  const env = setup(t), { a, w, clock, policy } = env;
+  w.fetch = async () => response(mcBodyNotice);
+  await a.runRangeScan(options(env, [794], { parserMode: 'auto', mode: 'title' }));
+  const e = a.state.results.get(794);
+  assert.equal(e.status, 'ok');
+  assert.equal(e.bodyComplete, true);
+  assert.equal(a.matchEntry(e, a.compileQuery('2025-2026'), 'title').hit, true);
+  assert.equal(a.matchEntry(e, a.compileQuery('跨学科兼修'), 'full').hit, true);
+  a.persistCache();
+  assert.equal(a.matchEntry(a.loadCache()[0], a.compileQuery('跨学科兼修'), 'full').hit, true);
+  fakeFrames(env, mcBodyNotice);
+  const iframe = a.scheduler.run(policy, task => a.processIframeNotice(task, 795));
+  await clock.tickAsync(5000);
+  const rendered = await iframe;
+  assert.equal(rendered.title, e.title);
+  assert.equal(rendered.bodyComplete, true);
+  assert.equal(rendered.bodyText, e.bodyText);
+});
+
+test('current-page bootstrap reads the mc-body template without issuing requests', t => {
+  const { a } = setup(t, { html: mcBodyNotice });
+  a.bootstrap();
+  assert.equal(a.state.results.get(10).title, '中国科学院大学2025-2026学年秋季学期研究生课程网络选课说明');
+  assert.equal(a.state.results.get(10).bodyComplete, true);
+});
+
 test('page chrome and unfilled/loading body containers cannot become full text', t => {
   const { a, doc } = setup(t);
   for (const body of [
@@ -208,6 +263,24 @@ test('skip completed respects mode, unchecked setting, failures, and 404 TTL', t
   assert.equal(a.needsFetch(4, options(env, [4])), false);
   clock.tick(86400000);
   assert.equal(a.needsFetch(4, options(env, [4])), true);
+});
+
+test('an older parser cache is revalidated even in title mode with skip completed on', async t => {
+  const env = setup(t), { a, session, w } = env;
+  session.setItem(a.cacheKey(), JSON.stringify({ v: 2, entries: [{
+    ...a.makeEntry(794, 'ok', { title: '旧版选中的正文小标题', bodyText: '旧版正文', bodyComplete: true }),
+    parserVersion: 3
+  }] }));
+  const old = a.loadCache()[0];
+  a.state.results.set(794, old);
+  assert.equal(old.bodyComplete, false);
+  assert.equal(a.needsFetch(794, options(env, [794], { mode: 'title' })), true);
+  assert.equal(a.needsFetch(794, options(env, [794], { mode: 'full' })), true);
+  w.fetch = async () => response(mcBodyNotice);
+  await a.runRangeScan(options(env, [794], { mode: 'title' }));
+  assert.equal(a.state.results.get(794).title, '中国科学院大学2025-2026学年秋季学期研究生课程网络选课说明');
+  assert.equal(a.needsFetch(794, options(env, [794], { mode: 'title' })), false);
+  assert.equal(a.needsFetch(794, options(env, [794], { mode: 'full' })), false);
 });
 
 test('quota fallback marks persisted body incomplete without truncating live search', t => {

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         UCAS 教务通知检索 / ID 导航
 // @namespace    https://jwxk.ucas.ac.cn/
-// @version      1.4.0
+// @version      1.4.1
 // @description  通知 ID 导航、范围检索、AND/OR/NOT 表达式与括号、可拖动悬浮球；支持自定义间隔、停止、失败重试和跨标签页互斥。
 // @author       DSH
 // @match        https://jwxk.ucas.ac.cn/*
@@ -12,7 +12,7 @@
 // ==/UserScript==
 
 /*
- * v1.4.0：收起为可拖动悬浮球；单框布尔表达式，支持 AND / OR / NOT、括号和引号。
+ * v1.4.1：修复低高度窗口滚动与结果列表压缩，支持 UCAS mc-body 通知模板。
  * 优先级 NOT > AND > OR；相邻关键词默认 AND，空表达式不限制结果。
  * 默认请求完成后等待 3～5 秒，可自定义；跨任务/标签页共享间隔和冷却。
  * 用本文件替换旧脚本，避免同时启用多个版本。推荐通过 HTTPS 使用。
@@ -22,10 +22,10 @@
  */
 (function () {
   'use strict';
-  const VERSION = '1.4.0';
+  const VERSION = '1.4.1';
   const NS = 'ucas_notice_nav_v2';
   const LEGACY_NS = 'ucas_notice_nav_v1';
-  const PARSER_VERSION = 3;
+  const PARSER_VERSION = 4;
   const RECOMMENDED = Object.freeze({ minSeconds: 3, maxSeconds: 5 });
   const MAX_INTERVAL_SECONDS = 86400;
   const MAX_RANGE_COUNT = 3000;
@@ -110,10 +110,12 @@
     /页面不存在|系统提示|无标题|access denied|not found|internal server error/i
   ];
   const TITLE_SELECTORS = [
+    '.m-cbox > .mc-body > h3', '.mc-body > h3',
     '.notice-title', '.article-title', '.detail-title', '.cont-title', '.content-title',
     '.article h1', '.detail h1', '.notice h1', 'h1', 'h2.title', 'h3.title', '.title'
   ];
   const BODY_SELECTORS = [
+    '.m-cbox > .mc-body > h3 + div:not(#existsfiles)', '.mc-body > h3 + div:not(#existsfiles)',
     '.notice-content', '.article-content', '.detail-content', '.content-detail', '.article-body',
     '.notice-body', '.news-content', '.view-content', '.show-content', '.rich-text',
     '.ql-editor', '.editor-content', '.content-body'
@@ -347,6 +349,7 @@
     if (options.force || !options.skipCached) return true;
     if (!e || e.lastFailure) return true;
     if (e.status === 'notfound') return !e.fetchedAt || now() - e.fetchedAt >= NOTFOUND_TTL_MS;
+    if (e.status === 'ok' && e.parserVersion !== PARSER_VERSION) return true;
     return options.mode === 'full' ? !(e.status === 'ok' && e.bodyComplete) : e.status !== 'ok';
   }
   function retryIds() {
@@ -796,11 +799,13 @@
 :host{all:initial;display:block;--bg:#fff;--fg:#111827;--muted:#6b7280;--bd:#e5e7eb;--soft:#f6f7f9;--soft2:#eef2ff;--accent:#2563eb;--danger:#dc2626}
 *{box-sizing:border-box}[hidden]{display:none!important}
 @media(prefers-color-scheme:dark){:host{--bg:#161a21;--fg:#e5e7eb;--muted:#9aa4b2;--bd:#2c333d;--soft:#1f242c;--soft2:#1e293b;--accent:#3b82f6;--danger:#f87171}}
-.panel{position:fixed;top:48px;right:16px;width:410px;max-height:calc(100vh - 64px);display:flex;flex-direction:column;z-index:2147483647;background:var(--bg);color:var(--fg);border:1px solid var(--bd);border-radius:14px;box-shadow:0 18px 48px #0f172a38;overflow:hidden;font:12.5px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif}
+.panel{position:fixed;top:16px;right:16px;width:410px;max-height:calc(100vh - 32px);max-height:calc(100dvh - 32px);display:flex;flex-direction:column;z-index:2147483647;background:var(--bg);color:var(--fg);border:1px solid var(--bd);border-radius:14px;box-shadow:0 18px 48px #0f172a38;overflow:hidden;font:12.5px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif}
 @media(max-width:760px){.panel{left:8px;right:8px;width:auto}}
-.hdr{display:flex;align-items:center;gap:8px;padding:10px 12px;background:linear-gradient(135deg,#1d4ed8,#2563eb);color:#fff}
+@media(max-height:480px){.panel{top:8px;max-height:calc(100vh - 16px);max-height:calc(100dvh - 16px)}}
+.hdr{flex:0 0 auto;display:flex;align-items:center;gap:8px;padding:10px 12px;background:linear-gradient(135deg,#1d4ed8,#2563eb);color:#fff}
 .hdr strong{flex:1}.hdr small{opacity:.8}.hdr button{padding:1px 8px;background:#ffffff22;color:white;border:0}
-.body{display:flex;flex-direction:column;gap:10px;padding:10px 12px 12px;overflow:auto}
+.body{flex:1 1 auto;min-height:0;display:flex;flex-direction:column;gap:10px;padding:10px 12px 12px;overflow-y:auto;overflow-x:hidden;overscroll-behavior:contain;scrollbar-gutter:stable}
+.body>*{flex:0 0 auto}
 .sec{border:1px solid var(--bd);background:var(--soft);border-radius:10px;padding:9px 10px}
 .cur{background:var(--soft2)}.cur strong{overflow-wrap:anywhere}.hint{color:var(--muted);font-size:11px;line-height:1.6}.sec-title{font-weight:650;margin-bottom:7px}
 .row{display:flex;gap:6px;align-items:center}.row+.row{margin-top:7px}.wrap{flex-wrap:wrap}.grow{flex:1;min-width:0}
@@ -812,7 +817,7 @@ button:hover{background:var(--soft2)}button:disabled{opacity:.45;cursor:not-allo
 details{margin:8px 0;border:1px dashed var(--bd);border-radius:8px;padding:6px 8px}summary{cursor:pointer;font-size:11.5px}details .row{margin-top:7px}.freq input[type=number]{width:76px}
 .err{color:var(--danger);font-size:11px}.tag{display:inline-block;padding:0 6px;border-radius:20px;background:var(--accent);color:#fff;font-size:10.5px;line-height:18px}.tag.gray{background:var(--soft);border:1px solid var(--bd);color:var(--muted)}.tag.pending{background:#b45309;color:#fff}
 .prog{height:5px;background:var(--bd);border-radius:20px;overflow:hidden;margin:8px 0 5px}.prog i{display:block;background:var(--accent);height:100%;width:0}
-.results{max-height:32vh;overflow:auto;border:1px solid var(--bd);border-radius:9px}.empty{padding:15px;color:var(--muted);font-size:11.5px}
+.results{min-height:120px;max-height:32vh;max-height:min(320px,40dvh);overflow-y:auto;overflow-x:hidden;border:1px solid var(--bd);border-radius:9px;scrollbar-gutter:stable}.results:focus-visible,.body:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}.empty{padding:15px;color:var(--muted);font-size:11.5px}
 .item{display:flex;gap:6px;padding:8px;border-bottom:1px solid var(--bd)}.item:last-child{border:0}.item a{flex:1;min-width:0;text-decoration:none;color:inherit;overflow-wrap:anywhere}.item .id{color:var(--accent);font-weight:650;margin-right:5px}.item .meta{display:flex;gap:5px;flex-wrap:wrap;margin-top:4px}.item .go{align-self:flex-start;padding:1px 6px}
 mark{background:#fde68a;color:#78350f;border-radius:2px}.banner{padding:8px;border:1px solid #dc262640;background:#dc262610;color:var(--danger);border-radius:8px;font-size:11.5px;white-space:pre-wrap}.banner:empty{display:none}
 .toast{position:fixed;right:20px;bottom:25px;max-width:380px;z-index:2147483647;padding:8px 12px;border-radius:8px;background:#111827f2;color:#fff;font:12px/1.5 sans-serif;opacity:0;pointer-events:none}.toast.show{opacity:1}
@@ -821,8 +826,8 @@ mark{background:#fde68a;color:#78350f;border-radius:2px}.banner{padding:8px;bord
 `;
   const HTML = `
 <div class="panel" id="panel">
- <div class="hdr"><strong>教务通知检索</strong><small>v${VERSION}</small><button id="collapse" title="收起为悬浮球" aria-label="收起为悬浮球" aria-controls="panel">−</button></div>
- <div class="body">
+ <div class="hdr"><strong>教务通知检索</strong><small>v${VERSION}</small><button id="showResults" title="滚动到扫描结果" aria-label="查看扫描结果" aria-controls="results">结果</button><button id="collapse" title="收起为悬浮球" aria-label="收起为悬浮球" aria-controls="panel">−</button></div>
+ <div class="body" id="panelBody" tabindex="0" role="region" aria-label="通知检索面板内容">
   <div class="sec cur"><strong id="curTitle"></strong><div class="hint" id="curMeta"></div></div>
   <div class="banner" id="banner"></div>
   <div class="sec">
@@ -848,7 +853,7 @@ mark{background:#fde68a;color:#78350f;border-radius:2px}.banner{padding:8px;bord
    <div class="prog"><i id="progressBar"></i></div><div class="hint" id="scanStats">就绪</div><div class="hint" id="taskPolicy"></div><div class="hint" id="waitStatus"></div>
   </div>
   <div class="row"><strong class="grow">结果 <span class="tag" id="hitBadge">0</span></strong><button class="small" id="diag">诊断</button><button class="small" id="copy">复制</button><button class="small" id="clear">清空</button></div>
-  <div class="hint" id="resultCounts"></div><div class="results" id="results"></div>
+  <div class="hint" id="resultCounts"></div><div class="results" id="results" tabindex="0" role="region" aria-label="扫描结果"></div>
   <div class="hint">正文未完整时，无法确认的条件显示“待检查”。全文指页面正文，不含附件内部文字。标题在新标签打开，↵ 在本页打开。Alt+N 收起 / 展开。</div>
  </div>
 </div><button class="float-ball" id="floatBall" hidden aria-label="展开通知检索面板" aria-controls="panel" aria-expanded="false" title="点击展开，拖动调整位置；聚焦后可用方向键移动"><span>通知</span><small id="floatState">打开</small></button><div class="toast" id="toast" role="status"></div>`;
@@ -1198,6 +1203,10 @@ mark{background:#fde68a;color:#78350f;border-radius:2px}.banner{padding:8px;bord
   }
   function bindEvents() {
     const e = ui.els;
+    e.showResults.addEventListener('click', () => {
+      e.panelBody.scrollTop += e.results.getBoundingClientRect().top - e.panelBody.getBoundingClientRect().top - 10;
+      e.results.focus({ preventScroll: true });
+    });
     e.scan.addEventListener('click', () => { void startScan(); });
     e.force.addEventListener('click', () => { void startScan(false, true); });
     e.retry.addEventListener('click', () => { void startScan(true); });
