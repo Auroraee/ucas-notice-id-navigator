@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         UCAS 教务通知检索 / ID 导航
 // @namespace    https://jwxk.ucas.ac.cn/
-// @version      1.3.0
-// @description  通知 ID 导航、范围检索、与/或/非关键词、标题/全文筛选；推荐或自定义间隔，支持停止、失败重试和跨标签页互斥。
+// @version      1.4.0
+// @description  通知 ID 导航、范围检索、AND/OR/NOT 表达式与括号、可拖动悬浮球；支持自定义间隔、停止、失败重试和跨标签页互斥。
 // @author       DSH
 // @match        https://jwxk.ucas.ac.cn/*
 // @match        http://jwxk.ucas.ac.cn/*
@@ -12,8 +12,8 @@
 // ==/UserScript==
 
 /*
- * v1.3.0：移除抓列表、一键选课与自动网络探测；增加与/或/非三组关键词。
- * 全部包含 AND (任一包含) AND NOT (排除词中的任一个)；组内空格分词，空组不限制。
+ * v1.4.0：收起为可拖动悬浮球；单框布尔表达式，支持 AND / OR / NOT、括号和引号。
+ * 优先级 NOT > AND > OR；相邻关键词默认 AND，空表达式不限制结果。
  * 默认请求完成后等待 3～5 秒，可自定义；跨任务/标签页共享间隔和冷却。
  * 用本文件替换旧脚本，避免同时启用多个版本。推荐通过 HTTPS 使用。
  * 浏览器不支持 Web Locks 时保留导航和缓存筛选，扫描会提示切换浏览器/HTTPS。
@@ -22,13 +22,16 @@
  */
 (function () {
   'use strict';
-  const VERSION = '1.3.0';
+  const VERSION = '1.4.0';
   const NS = 'ucas_notice_nav_v2';
   const LEGACY_NS = 'ucas_notice_nav_v1';
   const PARSER_VERSION = 3;
   const RECOMMENDED = Object.freeze({ minSeconds: 3, maxSeconds: 5 });
   const MAX_INTERVAL_SECONDS = 86400;
   const MAX_RANGE_COUNT = 3000;
+  const MAX_QUERY_LENGTH = 8192;
+  const BALL_SIZE = 56;
+  const BALL_MARGIN = 8;
   const HTTP_TIMEOUT_MS = 15000;
   const IFRAME_TIMEOUT_MS = 12000;
   const IFRAME_STABLE_MS = 750;
@@ -59,7 +62,8 @@
   const state = {
     config: null, results: new Map(), task: null, scanStats: null,
     storageWarning: '', authNotice: '', persistTimer: 0, renderTimer: 0,
-    lastValidCustom: { min: 3, max: 5 }, currentParsed: null, currentFetchedByTask: false
+    lastValidCustom: { min: 3, max: 5 }, currentParsed: null, currentFetchedByTask: false,
+    ballPosition: null
   };
   let ui = null;
   const now = () => Date.now();
@@ -249,8 +253,8 @@
   }
   function defaultConfig() {
     return {
-      version: 3, requestPolicy: { mode: 'recommended', customMinSeconds: 3, customMaxSeconds: 5 },
-      ui: { from: '', to: '', all: '', any: '', none: '', searchMode: 'title', parserMode: 'auto', onlyHit: true, skipCached: true, collapsed: false }
+      version: 4, requestPolicy: { mode: 'recommended', customMinSeconds: 3, customMaxSeconds: 5 },
+      ui: { from: '', to: '', expression: '', searchMode: 'title', parserMode: 'auto', onlyHit: true, skipCached: true, collapsed: false, ballPosition: null }
     };
   }
   function loadConfig() {
@@ -270,8 +274,10 @@
     }
     const u = raw.ui || raw;
     for (const key of ['from', 'to']) if (parseSafeId(u[key])) cfg.ui[key] = String(u[key]);
-    for (const key of ['all', 'any', 'none']) if (typeof u[key] === 'string') cfg.ui[key] = u[key].slice(0, 500);
-    if (typeof u.all !== 'string' && typeof u.keyword === 'string') cfg.ui.all = u.keyword.slice(0, 500);
+    cfg.ui.expression = typeof u.expression === 'string' ? u.expression : migrateKeywordExpression(u);
+    if (u.ballPosition && Number.isFinite(u.ballPosition.x) && Number.isFinite(u.ballPosition.y)) {
+      cfg.ui.ballPosition = { x: u.ballPosition.x, y: u.ballPosition.y };
+    }
     for (const key of ['onlyHit', 'skipCached', 'collapsed']) if (typeof u[key] === 'boolean') cfg.ui[key] = u[key];
     if (['title', 'full'].includes(u.searchMode)) cfg.ui.searchMode = u.searchMode;
     if (['auto', 'http', 'iframe'].includes(u.parserMode)) cfg.ui.parserMode = u.parserMode;
@@ -618,8 +624,18 @@
     return http.status === 'ok' ? http : iframe;
   }
 
-  // ---------- 与 / 或 / 非；正文未完整时采用三态结果 ----------
+  // ---------- 布尔表达式：词法分析 → 语法树 → 三态求值，不执行输入的代码 ----------
   function tokenize(text) { return String(text || '').trim().split(/\s+/).filter(Boolean); }
+  function migrateKeywordExpression(fields) {
+    const terms = (s) => tokenize(typeof s === 'string' ? s.slice(0, 500) : '').map((t) => JSON.stringify(t));
+    const all = terms(typeof fields.all === 'string' ? fields.all : fields.keyword);
+    const any = terms(fields.any), none = terms(fields.none);
+    return [
+      all.join(' AND '),
+      any.length ? '(' + any.join(' OR ') + ')' : '',
+      none.length ? 'NOT (' + none.join(' OR ') + ')' : ''
+    ].filter(Boolean).join(' AND ');
+  }
   function foldChar(c) {
     return c.normalize('NFKC').toLowerCase().replace(/\s/g, '').replace(/[‐‑‒–—―]/g, '-').replace(/['“”‘’「」]/g, '"');
   }
@@ -634,13 +650,109 @@
     }
     return { text: out, map };
   }
-  function compileQuery(fields) {
-    const group = (s) => [...new Set(tokenize(s).map((t) => foldText(t).text).filter(Boolean))];
-    return { all: group(fields.all), any: group(fields.any), none: group(fields.none),
-      highlight: [...new Set([...tokenize(fields.all), ...tokenize(fields.any)])] };
+  function compileQuery(expression) {
+    const input = String(expression ?? '');
+    const fail = (message, at) => { throw Object.assign(new Error(message), { at }); };
+    try {
+      if (input.length > MAX_QUERY_LENGTH) fail('表达式最多 ' + MAX_QUERY_LENGTH + ' 个字符', MAX_QUERY_LENGTH);
+      const tokens = [];
+      let pos = 0;
+      while (pos < input.length) {
+        if (/\s/.test(input[pos])) { pos++; continue; }
+        const at = pos, c = input[pos];
+        if ('()（）'.includes(c)) {
+          tokens.push({ type: '（('.includes(c) ? '(' : ')', at }); pos++;
+        } else if (c === '"' || c === '“') {
+          const close = c === '“' ? '”' : '"';
+          let value = '', closed = false;
+          pos++;
+          while (pos < input.length) {
+            const ch = input[pos++];
+            if (ch === close) { closed = true; break; }
+            if (ch === '\\') {
+              if (pos >= input.length) fail('转义符后缺少字符', pos - 1);
+              value += input[pos++];
+            } else value += ch;
+          }
+          if (!closed) fail('引号未闭合', at);
+          if (!foldText(value).text) fail('引号中的关键词不能为空', at);
+          tokens.push({ type: 'term', value, at });
+        } else {
+          let value = '';
+          while (pos < input.length && !/[\s()（）"“”]/.test(input[pos])) value += input[pos++];
+          if (!value) fail('没有对应的左引号', at);
+          const operator = value.normalize('NFKC').toUpperCase();
+          tokens.push({ type: ['AND', 'OR', 'NOT'].includes(operator) ? operator : 'term', value, at });
+        }
+        if (tokens.length > 2048) fail('表达式过于复杂，请减少关键词或括号', at);
+      }
+      tokens.push({ type: 'end', at: input.length });
+      let index = 0;
+      const peek = () => tokens[index];
+      const accept = (type) => peek().type === type ? (index++, true) : false;
+      function unary(depth) {
+        if (depth > 64) fail('括号或 NOT 嵌套不能超过 64 层', peek().at);
+        if (accept('NOT')) return { type: 'not', child: unary(depth + 1) };
+        if (accept('(')) {
+          if (peek().type === ')') fail('括号中缺少关键词', peek().at);
+          const node = disjunction(depth + 1);
+          if (!accept(')')) fail('缺少右括号 )', peek().at);
+          return node;
+        }
+        if (peek().type === 'term') {
+          const token = tokens[index++];
+          return { type: 'term', value: foldText(token.value).text, raw: token.value };
+        }
+        fail('此处需要关键词、NOT 或左括号 (', peek().at);
+      }
+      function conjunction(depth) {
+        const children = [unary(depth)];
+        while (true) {
+          if (accept('AND')) children.push(unary(depth));
+          else if (['term', '(', 'NOT'].includes(peek().type)) children.push(unary(depth)); // 隐式 AND
+          else break;
+        }
+        return children.length === 1 ? children[0] : { type: 'and', children };
+      }
+      function disjunction(depth) {
+        const children = [conjunction(depth)];
+        while (accept('OR')) children.push(conjunction(depth));
+        return children.length === 1 ? children[0] : { type: 'or', children };
+      }
+      const ast = peek().type === 'end' ? { type: 'true' } : disjunction(0);
+      if (peek().type !== 'end') fail('多余的右括号 ) 或缺少运算符', peek().at);
+      const highlight = new Set();
+      function visit(node, negated = false) {
+        if (node.type === 'term' && !negated) highlight.add(node.raw);
+        else if (node.type === 'not') visit(node.child, !negated);
+        else node.children?.forEach((child) => visit(child, negated));
+      }
+      visit(ast);
+      return { valid: true, ast, highlight: [...highlight], error: '' };
+    } catch (e) {
+      return { valid: false, ast: null, highlight: [], error: '第 ' + ((e.at ?? 0) + 1) + ' 位：' + e.message };
+    }
+  }
+  // null 表示全文未完成，无法确认。NOT 未知仍未知，避免把尚未读取的排除词当作不存在。
+  function evaluateQuery(node, termValue) {
+    if (node.type === 'true') return true;
+    if (node.type === 'term') return termValue(node.value);
+    if (node.type === 'not') {
+      const value = evaluateQuery(node.child, termValue);
+      return value === null ? null : !value;
+    }
+    let unknown = false;
+    for (const child of node.children) {
+      const value = evaluateQuery(child, termValue);
+      if (node.type === 'and' && value === false) return false;
+      if (node.type === 'or' && value === true) return true;
+      if (value === null) unknown = true;
+    }
+    return unknown ? null : node.type === 'and';
   }
   const normalizedEntries = new WeakMap();
   function matchEntry(entry, query, mode) {
+    if (!query.valid) return { hit: false, pending: false, inTitle: false };
     let folded = normalizedEntries.get(entry);
     if (!folded || folded.rawTitle !== entry.title || folded.rawBody !== entry.bodyText) {
       folded = { rawTitle: entry.title, rawBody: entry.bodyText, title: foldText(entry.title).text, body: foldText(entry.bodyText).text };
@@ -648,12 +760,10 @@
     }
     const inTitle = (t) => folded.title.includes(t);
     const contains = (t) => inTitle(t) || (mode === 'full' && folded.body.includes(t));
-    const excluded = query.none.some(contains);
-    const positive = query.all.every(contains) && (!query.any.length || query.any.some(contains));
     const incomplete = mode === 'full' && !entry.bodyComplete;
-    const pending = !excluded && incomplete && (!positive || query.none.length > 0);
-    return { hit: !excluded && positive && !pending, pending,
-      inTitle: query.all.every(inTitle) && (!query.any.length || query.any.some(inTitle)) };
+    const value = evaluateQuery(query.ast, (term) => contains(term) ? true : incomplete ? null : false);
+    const titleValue = evaluateQuery(query.ast, (term) => inTitle(term) ? true : mode === 'full' ? null : false);
+    return { hit: value === true, pending: value === null, inTitle: titleValue === true };
   }
   function highlightText(text, tokens) {
     const src = String(text || ''), folded = foldText(src, true), ranges = [];
@@ -684,13 +794,13 @@
   // ---------- UI ----------
   const CSS = `
 :host{all:initial;display:block;--bg:#fff;--fg:#111827;--muted:#6b7280;--bd:#e5e7eb;--soft:#f6f7f9;--soft2:#eef2ff;--accent:#2563eb;--danger:#dc2626}
-*{box-sizing:border-box}
+*{box-sizing:border-box}[hidden]{display:none!important}
 @media(prefers-color-scheme:dark){:host{--bg:#161a21;--fg:#e5e7eb;--muted:#9aa4b2;--bd:#2c333d;--soft:#1f242c;--soft2:#1e293b;--accent:#3b82f6;--danger:#f87171}}
 .panel{position:fixed;top:48px;right:16px;width:410px;max-height:calc(100vh - 64px);display:flex;flex-direction:column;z-index:2147483647;background:var(--bg);color:var(--fg);border:1px solid var(--bd);border-radius:14px;box-shadow:0 18px 48px #0f172a38;overflow:hidden;font:12.5px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif}
 @media(max-width:760px){.panel{left:8px;right:8px;width:auto}}
 .hdr{display:flex;align-items:center;gap:8px;padding:10px 12px;background:linear-gradient(135deg,#1d4ed8,#2563eb);color:#fff}
 .hdr strong{flex:1}.hdr small{opacity:.8}.hdr button{padding:1px 8px;background:#ffffff22;color:white;border:0}
-.body{display:flex;flex-direction:column;gap:10px;padding:10px 12px 12px;overflow:auto}.collapsed .body{display:none}
+.body{display:flex;flex-direction:column;gap:10px;padding:10px 12px 12px;overflow:auto}
 .sec{border:1px solid var(--bd);background:var(--soft);border-radius:10px;padding:9px 10px}
 .cur{background:var(--soft2)}.cur strong{overflow-wrap:anywhere}.hint{color:var(--muted);font-size:11px;line-height:1.6}.sec-title{font-weight:650;margin-bottom:7px}
 .row{display:flex;gap:6px;align-items:center}.row+.row{margin-top:7px}.wrap{flex-wrap:wrap}.grow{flex:1;min-width:0}
@@ -698,7 +808,7 @@ input[type=number],input[type=text],select{min-width:0;padding:6px 8px;border:1p
 input:focus,select:focus{outline:2px solid var(--accent);outline-offset:1px}input.invalid{border-color:var(--danger)}
 button{font:inherit;padding:6px 9px;border-radius:7px;border:1px solid var(--bd);background:var(--bg);color:var(--fg);cursor:pointer;white-space:nowrap}
 button:hover{background:var(--soft2)}button:disabled{opacity:.45;cursor:not-allowed}.primary{background:var(--accent);color:#fff;border-color:var(--accent)}
-.small{font-size:11px;padding:3px 7px}.filters{display:grid;grid-template-columns:auto minmax(0,1fr);gap:7px;align-items:center}.filters label{font-size:11.5px}.filters input{width:100%}
+.small{font-size:11px;padding:3px 7px}.query-label{display:block;font-size:11.5px;margin-bottom:5px}.query-input{width:100%}.query-tools{display:flex;gap:5px;margin-top:6px}.query-tools button{font:600 11px/1.4 ui-monospace,monospace}
 details{margin:8px 0;border:1px dashed var(--bd);border-radius:8px;padding:6px 8px}summary{cursor:pointer;font-size:11.5px}details .row{margin-top:7px}.freq input[type=number]{width:76px}
 .err{color:var(--danger);font-size:11px}.tag{display:inline-block;padding:0 6px;border-radius:20px;background:var(--accent);color:#fff;font-size:10.5px;line-height:18px}.tag.gray{background:var(--soft);border:1px solid var(--bd);color:var(--muted)}.tag.pending{background:#b45309;color:#fff}
 .prog{height:5px;background:var(--bd);border-radius:20px;overflow:hidden;margin:8px 0 5px}.prog i{display:block;background:var(--accent);height:100%;width:0}
@@ -706,10 +816,12 @@ details{margin:8px 0;border:1px dashed var(--bd);border-radius:8px;padding:6px 8
 .item{display:flex;gap:6px;padding:8px;border-bottom:1px solid var(--bd)}.item:last-child{border:0}.item a{flex:1;min-width:0;text-decoration:none;color:inherit;overflow-wrap:anywhere}.item .id{color:var(--accent);font-weight:650;margin-right:5px}.item .meta{display:flex;gap:5px;flex-wrap:wrap;margin-top:4px}.item .go{align-self:flex-start;padding:1px 6px}
 mark{background:#fde68a;color:#78350f;border-radius:2px}.banner{padding:8px;border:1px solid #dc262640;background:#dc262610;color:var(--danger);border-radius:8px;font-size:11.5px;white-space:pre-wrap}.banner:empty{display:none}
 .toast{position:fixed;right:20px;bottom:25px;max-width:380px;z-index:2147483647;padding:8px 12px;border-radius:8px;background:#111827f2;color:#fff;font:12px/1.5 sans-serif;opacity:0;pointer-events:none}.toast.show{opacity:1}
+.float-ball{position:fixed;width:56px;height:56px;border-radius:50%;padding:0;border:1px solid #ffffff55;z-index:2147483647;background:linear-gradient(145deg,#2563eb,#1d4ed8);color:#fff;box-shadow:0 4px 18px #0f172a40;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:1px;font:600 13px/1.25 "Microsoft YaHei",sans-serif;touch-action:none;user-select:none;cursor:grab}
+.float-ball:hover{background:linear-gradient(145deg,#3b82f6,#1d4ed8)}.float-ball.dragging{cursor:grabbing;box-shadow:0 6px 24px #0f172a55}.float-ball:focus-visible{outline:3px solid #93c5fd;outline-offset:3px}.float-ball small{font-size:10px;font-weight:400;opacity:.85}.float-ball[data-state=paused]{border:3px solid #fbbf24}.float-ball[data-state=running]{border:3px solid #86efac}
 `;
   const HTML = `
 <div class="panel" id="panel">
- <div class="hdr"><strong>教务通知检索</strong><small>v${VERSION}</small><button id="collapse" title="折叠 / 展开" aria-label="折叠 / 展开">−</button></div>
+ <div class="hdr"><strong>教务通知检索</strong><small>v${VERSION}</small><button id="collapse" title="收起为悬浮球" aria-label="收起为悬浮球" aria-controls="panel">−</button></div>
  <div class="body">
   <div class="sec cur"><strong id="curTitle"></strong><div class="hint" id="curMeta"></div></div>
   <div class="banner" id="banner"></div>
@@ -725,12 +837,11 @@ mark{background:#fde68a;color:#78350f;border-radius:2px}.banner{padding:8px;bord
     <div class="row"><input id="freqMin" type="number" min="0.001" step="any" aria-label="最小间隔秒数"><span>～</span><input id="freqMax" type="number" min="0.001" step="any" aria-label="最大间隔秒数"><span>秒</span><button class="small" id="freqReset">恢复推荐</button></div>
     <div class="err" id="freqErr"></div><div class="hint">上一条页面抓取结束后再等待；两值相同表示固定间隔。运行中修改，下次任务生效。</div>
    </details>
-   <div class="filters">
-    <label for="allWords">全部包含 · 与</label><input id="allWords" type="text" maxlength="500" placeholder="例如：选课 通知">
-    <label for="anyWords">任一包含 · 或</label><input id="anyWords" type="text" maxlength="500" placeholder="例如：秋季 春季">
-    <label for="noneWords">排除词 · 非</label><input id="noneWords" type="text" maxlength="500" placeholder="例如：补选 取消">
-   </div>
-   <div class="hint" style="margin:6px 0">每组用空格分词；同时满足三组条件，留空不限制。筛选实时更新已有结果。</div>
+   <label class="query-label" for="expression">关键词表达式</label>
+   <input class="query-input" id="expression" type="text" maxlength="${MAX_QUERY_LENGTH}" placeholder="选课 AND (秋季 OR 春季) AND NOT 补选" aria-describedby="queryHelp queryError" autocomplete="off" spellcheck="false">
+   <div class="query-tools"><button class="small" data-insert="AND" aria-label="插入 AND">AND</button><button class="small" data-insert="OR" aria-label="插入 OR">OR</button><button class="small" data-insert="NOT" aria-label="插入 NOT">NOT</button><button class="small" data-insert="()" aria-label="插入括号">()</button></div>
+   <div class="err" id="queryError" role="alert"></div>
+   <div class="hint" id="queryHelp" style="margin:6px 0">优先级 NOT → AND → OR，括号优先；空格默认 AND。用双引号包住含空格、括号或运算符的关键词。留空不限制。</div>
    <div class="row"><select id="searchMode" class="grow" aria-label="搜索范围"><option value="title">标题搜索</option><option value="full">标题 + 全文</option></select><select id="parserMode" class="grow" aria-label="解析方式"><option value="auto">自动解析</option><option value="http">仅 HTTP</option><option value="iframe">强制 iframe</option></select></div>
    <div class="row wrap"><button class="primary" id="scan">开始扫描</button><button id="stop" disabled>停止</button><button id="resume" disabled>继续</button><button id="retry" disabled>重试失败项</button><button id="force">强制重扫</button></div>
    <div class="row wrap hint"><label><input id="onlyHit" type="checkbox"> 只看命中 / 待检查</label><label title="取消后重新获取范围内全部记录"><input id="skipCached" type="checkbox"> 跳过已完成</label></div>
@@ -738,9 +849,9 @@ mark{background:#fde68a;color:#78350f;border-radius:2px}.banner{padding:8px;bord
   </div>
   <div class="row"><strong class="grow">结果 <span class="tag" id="hitBadge">0</span></strong><button class="small" id="diag">诊断</button><button class="small" id="copy">复制</button><button class="small" id="clear">清空</button></div>
   <div class="hint" id="resultCounts"></div><div class="results" id="results"></div>
-  <div class="hint">正文未完整时，无法确认的条件显示“待检查”。全文指页面正文，不含附件内部文字。标题在新标签打开，↵ 在本页打开。Alt+N 隐藏 / 显示。</div>
+  <div class="hint">正文未完整时，无法确认的条件显示“待检查”。全文指页面正文，不含附件内部文字。标题在新标签打开，↵ 在本页打开。Alt+N 收起 / 展开。</div>
  </div>
-</div><div class="toast" id="toast" role="status"></div>`;
+</div><button class="float-ball" id="floatBall" hidden aria-label="展开通知检索面板" aria-controls="panel" aria-expanded="false" title="点击展开，拖动调整位置；聚焦后可用方向键移动"><span>通知</span><small id="floatState">打开</small></button><div class="toast" id="toast" role="status"></div>`;
   function buildUI() {
     if (document.getElementById('ucas-notice-nav-host')) return false;
     const host = document.createElement('div');
@@ -752,6 +863,81 @@ mark{background:#fde68a;color:#78350f;border-radius:2px}.banner{padding:8px;bord
     root.querySelectorAll('[id]').forEach((el) => { els[el.id] = el; });
     ui = { host, root, els };
     return true;
+  }
+  function placeFloatingBall(position = state.ballPosition) {
+    const width = window.innerWidth || document.documentElement.clientWidth || 1024;
+    const height = window.innerHeight || document.documentElement.clientHeight || 768;
+    const requested = position || { x: width - BALL_SIZE - 16, y: 48 };
+    const clamp = (value, size) => Math.round(Math.max(BALL_MARGIN, Math.min(value, Math.max(BALL_MARGIN, size - BALL_SIZE - BALL_MARGIN))));
+    state.ballPosition = { x: clamp(requested.x, width), y: clamp(requested.y, height) };
+    ui.els.floatBall.style.left = state.ballPosition.x + 'px';
+    ui.els.floatBall.style.top = state.ballPosition.y + 'px';
+  }
+  function setPanelCollapsed(collapsed, { persist = true, focus = true } = {}) {
+    ui.els.panel.hidden = collapsed;
+    ui.els.floatBall.hidden = !collapsed;
+    ui.els.floatBall.setAttribute('aria-expanded', String(!collapsed));
+    placeFloatingBall();
+    if (persist) saveConfig();
+    if (focus) (collapsed ? ui.els.floatBall : ui.els.collapse).focus({ preventScroll: true });
+  }
+  function bindFloatingBall() {
+    const ball = ui.els.floatBall;
+    let drag = null, suppressClick = false;
+    const move = (event) => {
+      if (!drag || event.pointerId !== drag.id) return;
+      const dx = event.clientX - drag.startX, dy = event.clientY - drag.startY;
+      if (!drag.moved && Math.hypot(dx, dy) < 5) return;
+      drag.moved = true;
+      ball.classList.add('dragging');
+      placeFloatingBall({ x: drag.origin.x + dx, y: drag.origin.y + dy });
+      if (event.cancelable) event.preventDefault();
+    };
+    const end = (cancelled) => {
+      if (!drag) return;
+      const finished = drag;
+      drag = null; // releasePointerCapture 可能立即触发 lostpointercapture
+      if (cancelled) placeFloatingBall(finished.origin);
+      suppressClick = cancelled || finished.moved;
+      ball.classList.remove('dragging');
+      try { ball.releasePointerCapture?.(finished.id); } catch (_) { /* 指针已释放 */ }
+      if (finished.moved) saveConfig();
+    };
+    ball.addEventListener('pointerdown', (event) => {
+      if (ball.hidden || drag || event.button !== 0 || event.isPrimary === false) return;
+      suppressClick = false;
+      drag = { id: event.pointerId, startX: event.clientX, startY: event.clientY, origin: { ...state.ballPosition }, moved: false };
+      ball.focus({ preventScroll: true });
+      try { ball.setPointerCapture?.(event.pointerId); } catch (_) { /* window 监听仍可完成拖动 */ }
+    });
+    window.addEventListener('pointermove', move);
+    window.addEventListener('pointerup', (event) => {
+      if (!drag || event.pointerId !== drag.id) return;
+      move(event); end(false);
+    });
+    window.addEventListener('pointercancel', (event) => { if (drag?.id === event.pointerId) end(true); });
+    ball.addEventListener('lostpointercapture', () => end(true));
+    window.addEventListener('blur', () => end(true));
+    ball.addEventListener('click', (event) => {
+      // 只吞掉拖动产生的指针 click；键盘/辅助技术触发的 detail=0 仍可以展开。
+      if (suppressClick && (event.detail !== 0 || event.pointerType)) { suppressClick = false; event.preventDefault(); return; }
+      suppressClick = false;
+      setPanelCollapsed(false);
+    });
+    ball.addEventListener('keydown', (event) => {
+      if (event.altKey || event.ctrlKey || event.metaKey) return;
+      const delta = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1] }[event.key];
+      if (!delta) return;
+      event.preventDefault();
+      const step = event.shiftKey ? 36 : 12;
+      placeFloatingBall({ x: state.ballPosition.x + delta[0] * step, y: state.ballPosition.y + delta[1] * step });
+      saveConfig();
+    });
+    window.addEventListener('resize', () => {
+      end(true);
+      placeFloatingBall();
+      saveConfig();
+    });
   }
   let toastTimer = 0;
   function toast(text, duration = 3500) {
@@ -787,9 +973,9 @@ mark{background:#fde68a;color:#78350f;border-radius:2px}.banner{padding:8px;bord
   function collectUiFields() {
     const e = ui.els;
     return {
-      from: e.rangeFrom.value, to: e.rangeTo.value, all: e.allWords.value, any: e.anyWords.value, none: e.noneWords.value,
+      from: e.rangeFrom.value, to: e.rangeTo.value, expression: e.expression.value,
       searchMode: e.searchMode.value, parserMode: e.parserMode.value, onlyHit: e.onlyHit.checked,
-      skipCached: e.skipCached.checked, collapsed: e.panel.classList.contains('collapsed')
+      skipCached: e.skipCached.checked, collapsed: e.panel.hidden, ballPosition: { ...state.ballPosition }
     };
   }
   function saveConfig() {
@@ -799,7 +985,7 @@ mark{background:#fde68a;color:#78350f;border-radius:2px}.banner{padding:8px;bord
       if (p.policy.mode === 'custom') state.lastValidCustom = { min: p.policy.minSeconds, max: p.policy.maxSeconds };
       rp = { mode: p.policy.mode, customMinSeconds: state.lastValidCustom.min, customMaxSeconds: state.lastValidCustom.max };
     }
-    state.config = { version: 3, requestPolicy: rp, ui: collectUiFields() };
+    state.config = { version: 4, requestPolicy: rp, ui: collectUiFields() };
     if (!writeRaw(localStorage, CFG_KEY, state.config)) {
       state.storageWarning = '设置保存失败，刷新后可能恢复为之前的配置。';
       renderBanner();
@@ -814,16 +1000,43 @@ mark{background:#fde68a;color:#78350f;border-radius:2px}.banner{padding:8px;bord
     e.rangeTo.value = u.to || (IS_DETAIL ? CUR_ID : '');
     e.jumpId.value = CUR_ID || '';
     e.prev.disabled = e.next.disabled = !IS_DETAIL;
-    e.allWords.value = u.all; e.anyWords.value = u.any; e.noneWords.value = u.none;
+    e.expression.value = u.expression;
     e.searchMode.value = u.searchMode; e.parserMode.value = u.parserMode;
     e.onlyHit.checked = u.onlyHit; e.skipCached.checked = u.skipCached;
-    e.panel.classList.toggle('collapsed', u.collapsed);
-    e.collapse.textContent = u.collapsed ? '+' : '−';
+    state.ballPosition = u.ballPosition;
+    setPanelCollapsed(u.collapsed, { persist: false, focus: false });
     updateFreqUI();
   }
-  function getQuery() { return compileQuery({ all: ui.els.allWords.value, any: ui.els.anyWords.value, none: ui.els.noneWords.value }); }
+  let cachedExpression = null, cachedQuery = null;
+  function getQuery() {
+    const expression = ui.els.expression.value;
+    if (expression !== cachedExpression) {
+      cachedExpression = expression; cachedQuery = compileQuery(expression);
+    }
+    return cachedQuery;
+  }
+  function updateQueryUI() {
+    const query = getQuery();
+    ui.els.queryError.textContent = query.error;
+    ui.els.expression.setAttribute('aria-invalid', String(!query.valid));
+    ui.els.expression.classList.toggle('invalid', !query.valid);
+    return query;
+  }
+  function insertQueryOperator(operator) {
+    const input = ui.els.expression;
+    const start = input.selectionStart ?? input.value.length, end = input.selectionEnd ?? start;
+    const selected = input.value.slice(start, end);
+    const wrapped = operator === '()' || (operator === 'NOT' && !!selected);
+    const inserted = wrapped ? (operator === 'NOT' ? 'NOT ' : '') + '(' + selected + ')' : ' ' + operator + ' ';
+    if (input.value.length - (end - start) + inserted.length > MAX_QUERY_LENGTH) { toast('表达式已达到长度上限。'); return; }
+    input.setRangeText(inserted, start, end, 'end');
+    if (operator === '()' && !selected) input.setSelectionRange(start + 1, start + 1);
+    input.focus({ preventScroll: true });
+    updateQueryUI(); saveConfig(); renderResults();
+  }
   function scoredResults() {
     const query = getQuery(), mode = ui.els.searchMode.value;
+    if (!query.valid) return [];
     return Array.from(state.results.values()).filter((e) => e.status === 'ok')
       .map((e) => ({ e, ...matchEntry(e, query, mode) })).sort((a, b) => b.e.id - a.e.id);
   }
@@ -832,14 +1045,22 @@ mark{background:#fde68a;color:#78350f;border-radius:2px}.banner{padding:8px;bord
   }
   function renderResults() {
     if (!ui) return;
-    const all = scoredResults(), query = getQuery();
+    const query = updateQueryUI();
+    if (!query.valid) {
+      ui.els.hitBadge.textContent = '—';
+      ui.els.resultCounts.textContent = '表达式有误，修正后重新筛选已有结果。';
+      ui.els.results.innerHTML = '<div class="empty">请按输入框下方提示修正表达式。已抓取的记录会保留。</div>';
+      updateRunUI();
+      return;
+    }
+    const all = scoredResults();
     const hits = all.filter((x) => x.hit).length, pending = all.filter((x) => x.pending).length;
     ui.els.hitBadge.textContent = hits;
     ui.els.resultCounts.textContent = '已收录 ' + all.length + ' · 命中 ' + hits + ' · 待检查 ' + pending + ' · 失败待重试 ' + retryIds().length;
     const list = ui.els.onlyHit.checked ? all.filter((x) => x.hit || x.pending) : all;
     const scroll = ui.els.results.scrollTop;
     ui.els.results.innerHTML = list.length ? list.map(({ e, hit, pending: unknown, inTitle }) => {
-      const label = unknown ? '待检查全文' : hit ? (inTitle ? '标题符合' : '正文符合') : '不符合';
+      const label = unknown ? '待检查全文' : hit ? (inTitle ? '标题符合' : '全文符合') : '不符合';
       const snippet = e.bodyText.slice(0, 100) + (e.bodyText.length > 100 ? '…' : '');
       return '<div class="item"><a href="' + esc(noticeUrl(e.id)) + '" target="_blank" rel="noopener noreferrer">' +
         '<span class="id">#' + e.id + '</span>' + highlightText(e.title, query.highlight) +
@@ -856,11 +1077,17 @@ mark{background:#fde68a;color:#78350f;border-radius:2px}.banner{padding:8px;bord
   function updateRunUI() {
     if (!ui) return;
     const busy = scheduler.running;
-    ui.els.scan.disabled = ui.els.force.disabled = busy;
-    ui.els.retry.disabled = busy || !retryIds().length;
+    const valid = updateQueryUI().valid;
+    ui.els.scan.disabled = ui.els.force.disabled = busy || !valid;
+    ui.els.retry.disabled = busy || !valid || !retryIds().length;
+    ui.els.copy.disabled = !valid;
     ui.els.clear.disabled = busy; ui.els.stop.disabled = !busy;
     ui.els.resume.disabled = !scheduler.current?.paused;
     if (busy) ui.els.scanState.textContent = scheduler.current?.paused ? '已暂停' : '扫描中…';
+    const ballState = busy ? (scheduler.current?.paused ? 'paused' : 'running') : 'idle';
+    ui.els.floatBall.dataset.state = ballState;
+    ui.els.floatState.textContent = { paused: '暂停', running: '扫描', idle: '打开' }[ballState];
+    ui.els.floatBall.setAttribute('aria-label', '展开通知检索面板' + (busy ? '，' + ui.els.floatState.textContent + '中' : ''));
     renderBanner();
   }
   function setWaitStatus(text) { if (ui) ui.els.waitStatus.textContent = text; }
@@ -918,6 +1145,7 @@ mark{background:#fde68a;color:#78350f;border-radius:2px}.banner{padding:8px;bord
   }
   async function startScan(retryOnly = false, force = false) {
     if (scheduler.running) { toast('已有任务运行中，请先停止或等待完成。'); return; }
+    if (!updateQueryUI().valid) { renderResults(); ui.els.expression.focus(); toast('请先修正关键词表达式。'); return; }
     const pol = readPolicyFromUI();
     if (!pol.ok) { updateFreqUI(); ui.els.freqFold.open = true; toast(pol.error); return; }
     let ids;
@@ -991,17 +1219,18 @@ mark{background:#fde68a;color:#78350f;border-radius:2px}.banner{padding:8px;bord
       updateFreqUI(); saveConfig();
       toast(scheduler.running ? '已恢复推荐频率，下次任务生效。' : '已恢复推荐频率。');
     });
-    for (const key of ['allWords', 'anyWords', 'noneWords']) e[key].addEventListener('input', () => { saveConfig(); scheduleRender(); });
+    e.expression.addEventListener('input', () => { updateRunUI(); saveConfig(); scheduleRender(); });
+    ui.root.querySelectorAll('[data-insert]').forEach((button) => {
+      button.addEventListener('click', () => insertQueryOperator(button.dataset.insert));
+    });
     for (const key of ['rangeFrom', 'rangeTo', 'searchMode', 'parserMode', 'onlyHit', 'skipCached']) {
       e[key].addEventListener('change', () => {
         saveConfig(); scheduleRender();
         if (scheduler.running && ['searchMode', 'parserMode', 'skipCached'].includes(key)) toast('筛选立即更新；抓取方式将在下次任务生效。');
       });
     }
-    e.collapse.addEventListener('click', () => {
-      const collapsed = e.panel.classList.toggle('collapsed');
-      e.collapse.textContent = collapsed ? '+' : '−'; saveConfig();
-    });
+    e.collapse.addEventListener('click', () => setPanelCollapsed(true));
+    bindFloatingBall();
     e.results.addEventListener('click', (event) => {
       const button = event.target.closest('[data-open-self]');
       if (button) { event.preventDefault(); goTo(button.dataset.openSelf); }
@@ -1036,7 +1265,7 @@ mark{background:#fde68a;color:#78350f;border-radius:2px}.banner{padding:8px;bord
       if (IS_DETAIL && ['ArrowUp', 'ArrowDown'].includes(event.key)) {
         event.preventDefault(); goTo(CUR_ID + (event.key === 'ArrowUp' ? 1 : -1));
       } else if (event.key.toLowerCase() === 'n') {
-        event.preventDefault(); ui.host.style.display = ui.host.style.display === 'none' ? '' : 'none';
+        event.preventDefault(); setPanelCollapsed(!e.panel.hidden);
       }
     }, true);
     window.addEventListener('pagehide', () => {

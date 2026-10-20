@@ -13,7 +13,7 @@ const exportsForTest = [
   'detectAuthIssue', 'looksLikeLoginPage', 'isLoginUrl', 'parseSafeId', 'compileQuery',
   'matchEntry', 'highlightText', 'parseRetryAfter', 'setCooldown', 'readCooldownUntil',
   'requestPage', 'runRangeScan', 'processHttpNotice', 'processIframeNotice', 'refreshCurrentPage',
-  'CFG_KEY', 'TIMING_KEY', 'COOLDOWN_KEY', 'cacheKey', 'renderResults'
+  'CFG_KEY', 'TIMING_KEY', 'COOLDOWN_KEY', 'cacheKey', 'renderResults', 'startScan', 'migrateKeywordExpression'
 ];
 assert.equal(source.split('  bootstrap();').length, 2, 'test instrumentation must target exactly one bootstrap');
 const instrumented = source.replace('  bootstrap();', `  globalThis.__test = { ${exportsForTest.join(',')} };`);
@@ -87,28 +87,29 @@ function fakeFrames(env, html) {
   return frames;
 }
 
-test('AND, OR and NOT apply together, with empty groups imposing no constraint', t => {
+test('AND, OR and NOT compose in a single expression, with empty input imposing no constraint', t => {
   const { a } = setup(t);
-  const query = a.compileQuery({ all: '选课 通知', any: '秋季 春季', none: '补选 取消' });
+  const query = a.compileQuery('选课 AND 通知 AND (秋季 OR 春季) AND NOT (补选 OR 取消)');
+  assert.equal(query.valid, true);
   const check = title => a.matchEntry(a.makeEntry(1, 'ok', { title }), query, 'title').hit;
   assert.equal(check('关于秋季选课的通知'), true);
   assert.equal(check('关于春季选课的通知'), true);
   assert.equal(check('关于夏季选课的通知'), false);
   assert.equal(check('关于秋季选课补选的通知'), false);
   assert.equal(check('秋季课程安排'), false);
-  const empty = a.compileQuery({});
+  const empty = a.compileQuery('');
   assert.equal(a.matchEntry(a.makeEntry(1, 'ok', { title: '通知正文' }), empty, 'title').hit, true);
 });
 
 test('unknown full text stays pending for NOT or missing positive terms', t => {
   const { a } = setup(t);
   const e = a.makeEntry(1, 'ok', { title: '秋季选课通知', bodyText: '正文尚未完整' });
-  const negative = a.compileQuery({ all: '选课', none: '补选' });
+  const negative = a.compileQuery('选课 AND NOT 补选');
   assert.equal(a.matchEntry(e, negative, 'full').pending, true);
   assert.equal(a.matchEntry(e, negative, 'full').hit, false);
   assert.equal(a.matchEntry(e, negative, 'title').hit, true);
-  assert.equal(a.matchEntry(e, a.compileQuery({ all: '奖学金' }), 'full').pending, true);
-  assert.equal(a.matchEntry(e, a.compileQuery({ all: '选课' }), 'full').hit, true);
+  assert.equal(a.matchEntry(e, a.compileQuery('奖学金'), 'full').pending, true);
+  assert.equal(a.matchEntry(e, a.compileQuery('选课'), 'full').hit, true);
   e.bodyText = '本通知用于补选';
   assert.equal(a.matchEntry(e, negative, 'full').pending, false);
   assert.equal(a.matchEntry(e, negative, 'full').hit, false);
@@ -124,8 +125,8 @@ test('full text beyond character 400 survives persistence and supports exclusion
   const loaded = a.loadCache()[0];
   assert.equal(loaded.bodyText, e.bodyText);
   assert.equal(loaded.bodyComplete, true);
-  assert.equal(a.matchEntry(loaded, a.compileQuery({ all: '尾部关键词' }), 'full').hit, true);
-  assert.equal(a.matchEntry(loaded, a.compileQuery({ all: '选课', none: '补选' }), 'full').hit, false);
+  assert.equal(a.matchEntry(loaded, a.compileQuery('尾部关键词'), 'full').hit, true);
+  assert.equal(a.matchEntry(loaded, a.compileQuery('选课 AND NOT 补选'), 'full').hit, false);
 });
 
 test('highlighting cannot alter markup or entities and supports Unicode normalization', t => {
@@ -136,7 +137,7 @@ test('highlighting cannot alter markup or entities and supports Unicode normaliz
   assert.equal(parsed.querySelector('#result').textContent, text);
   assert.equal(parsed.querySelectorAll('img,script,[onerror]').length, 0);
   assert.equal(parsed.querySelectorAll('mark').length, 5);
-  assert.equal(a.matchEntry(a.makeEntry(1, 'ok', { title: 'ＡＢＣ　选课' }), a.compileQuery({ all: 'abc 选课' }), 'title').hit, true);
+  assert.equal(a.matchEntry(a.makeEntry(1, 'ok', { title: 'ＡＢＣ　选课' }), a.compileQuery('abc 选课'), 'title').hit, true);
 });
 
 test('parser retains body headings and selects labeled publication date only', t => {
@@ -181,7 +182,7 @@ test('migration keeps keyword/filter choices but invalidates old body completene
     ui: { keyword: '选课 通知', searchMode: 'full', skipCached: false }
   }));
   const { cfg } = a.loadConfig();
-  assert.equal(cfg.ui.all, '选课 通知');
+  assert.equal(cfg.ui.expression, '"选课" AND "通知"');
   assert.equal(cfg.ui.skipCached, false);
   assert.equal(cfg.requestPolicy.mode, 'custom');
   session.setItem(a.cacheKey(), JSON.stringify({ v: 2, entries: [{
@@ -423,17 +424,16 @@ test('UI boots without network probes, removes list/preset controls, and saves b
   assert.equal(root.querySelector('#freqMin').disabled, true);
   assert.equal(root.querySelector('#freqSummary').textContent, '推荐：3～5 秒/次');
   assert.doesNotMatch(root.textContent, /抓列表|一键找选课/);
-  root.querySelector('#allWords').value = '选课';
-  root.querySelector('#anyWords').value = '秋季 春季';
-  root.querySelector('#noneWords').value = '补选';
-  root.querySelector('#noneWords').dispatchEvent(new w.Event('input'));
+  assert.equal(root.querySelectorAll('#allWords,#anyWords,#noneWords').length, 0);
+  root.querySelector('#expression').value = '选课 AND (秋季 OR 春季) AND NOT 补选';
+  root.querySelector('#expression').dispatchEvent(new w.Event('input'));
   await clock.tickAsync(140);
-  assert.equal(a.loadConfig().cfg.ui.none, '补选');
+  assert.equal(a.loadConfig().cfg.ui.expression, '选课 AND (秋季 OR 春季) AND NOT 补选');
   assert.equal(root.querySelector('#hitBadge').textContent, '1');
   const link = root.querySelector('#results a');
   assert.equal(link.target, '_blank');
-  root.querySelector('#noneWords').value = '秋季';
-  root.querySelector('#noneWords').dispatchEvent(new w.Event('input'));
+  root.querySelector('#expression').value = '选课 AND NOT 秋季';
+  root.querySelector('#expression').dispatchEvent(new w.Event('input'));
   await clock.tickAsync(140);
   assert.equal(root.querySelector('#hitBadge').textContent, '0');
   await clock.tickAsync(3200); // current-page DOM refreshes also must not issue requests
@@ -455,4 +455,273 @@ test('UI validates custom interval and persists selection; fresh users get recom
   assert.equal(a.loadConfig().cfg.requestPolicy.customMaxSeconds, 4);
   root.querySelector('#freqReset').click();
   assert.equal(a.loadConfig().cfg.requestPolicy.mode, 'recommended');
+});
+
+test('operator precedence, parentheses and repeated NOT implement arbitrary combinations', t => {
+  const { a } = setup(t);
+  const hit = (expression, title) => {
+    const q = a.compileQuery(expression);
+    assert.equal(q.valid, true, q.error);
+    return a.matchEntry(a.makeEntry(1, 'ok', { title }), q, 'title').hit;
+  };
+  assert.equal(hit('秋季 OR 春季 AND 选课', '秋季安排'), true);
+  assert.equal(hit('(秋季 OR 春季) AND 选课', '秋季安排'), false);
+  assert.equal(hit('NOT 秋季 AND 春季', '秋季春季通知'), false);
+  assert.equal(hit('NOT (秋季 AND 春季)', '秋季通知'), true);
+  assert.equal(hit('(选课 AND 秋季) OR (考试 AND NOT 补考)', '考试通知'), true);
+  assert.equal(hit('(选课 AND 秋季) OR (考试 AND NOT 补考)', '考试补考通知'), false);
+  assert.equal(hit('NOT NOT 选课', '选课通知'), true);
+  assert.equal(hit('选课（秋季 or 春季）not 补选', '春季选课通知'), true);
+  assert.equal(hit('选课 通知 NOT 补选', '选课补选通知'), false);
+  assert.equal(hit('"OR" OR "AND"', 'OR 运算规则'), true);
+  assert.equal(hit('“学术 英语” AND 通知', '学术英语课程通知'), true);
+  assert.equal(hit('"a\\"b" AND "c\\\\d"', 'a"b c\\d'), true);
+});
+
+test('syntax errors are explicit and bounded, never silently converted into a different query', t => {
+  const { a, w } = setup(t);
+  for (const input of ['AND 选课', 'OR', 'NOT', '选课 AND', '选课 OR OR 通知', '()', '(选课', '选课)', '"选课', '""', '”']) {
+    const q = a.compileQuery(input);
+    assert.equal(q.valid, false, input);
+    assert.match(q.error, /^第 \d+ 位：/);
+    assert.equal(a.matchEntry(a.makeEntry(1, 'ok', { title: '选课通知' }), q, 'title').hit, false);
+  }
+  assert.equal(a.compileQuery('('.repeat(70) + '选课' + ')'.repeat(70)).valid, false);
+  assert.equal(a.compileQuery('NOT '.repeat(70) + '选课').valid, false);
+  assert.equal(a.compileQuery('选课'.repeat(5000)).valid, false);
+  assert.equal(a.compileQuery('a '.repeat(2200)).valid, false);
+  a.compileQuery('globalThis.__pwned = true');
+  assert.equal(w.__pwned, undefined);
+});
+
+test('nested expressions propagate incomplete full text without false exclusions or positives', t => {
+  const { a } = setup(t);
+  const e = a.makeEntry(1, 'ok', { title: '选课通知', bodyText: '秋季课程', bodyComplete: false });
+  const match = (s) => a.matchEntry(e, a.compileQuery(s), 'full');
+  assert.equal(match('选课 OR NOT 补选').hit, true);
+  assert.equal(match('NOT (补选 OR 取消)').pending, true);
+  assert.equal(match('NOT (选课 OR 补选)').hit, false);
+  assert.equal(match('NOT (选课 OR 补选)').pending, false);
+  assert.equal(match('NOT 选课 AND 未知词').pending, false);
+  assert.equal(match('(选课 AND NOT 补选) OR 奖学金').pending, true);
+  assert.equal(match('NOT NOT 选课').hit, true);
+  assert.equal(match('NOT (未知词 AND NOT 选课)').hit, true);
+  e.bodyComplete = true;
+  assert.equal(match('(选课 AND NOT 补选) OR 奖学金').hit, true);
+  assert.equal(match('NOT (补选 OR 取消)').inTitle, false); // absence needs the full body
+  e.bodyText += '补选';
+  assert.equal(match('(选课 AND NOT 补选) OR 奖学金').hit, false);
+});
+
+test('highlights follow NOT parity without marking operator syntax or exclusions', t => {
+  const { a } = setup(t);
+  const q = a.compileQuery('选课 AND NOT (补选 OR 取消) OR NOT NOT "AND"');
+  assert.deepEqual(Array.from(q.highlight), ['选课', 'AND']);
+  assert.deepEqual(Array.from(a.compileQuery('NOT (选课 AND NOT 秋季)').highlight), ['秋季']);
+});
+
+test('legacy three-field queries migrate without reinterpreting reserved words and punctuation', t => {
+  const { a, local } = setup(t);
+  local.setItem(a.CFG_KEY, JSON.stringify({
+    version: 3, ui: { all: '选课 AND', any: '秋季 春季', none: '补选 (取消)', collapsed: true }
+  }));
+  const loaded = a.loadConfig().cfg;
+  assert.equal(loaded.version, 4);
+  assert.equal(loaded.ui.collapsed, true);
+  const q = a.compileQuery(loaded.ui.expression);
+  assert.equal(q.valid, true, q.error);
+  const hit = title => a.matchEntry(a.makeEntry(1, 'ok', { title }), q, 'title').hit;
+  assert.equal(hit('选课 AND 秋季通知'), true);
+  assert.equal(hit('选课 秋季通知'), false);
+  assert.equal(hit('选课 AND 秋季 (取消)'), false);
+  local.setItem(a.CFG_KEY, JSON.stringify({ ui: { expression: '(选课 OR 考试) AND NOT 取消', all: '过时设置' } }));
+  assert.equal(a.loadConfig().cfg.ui.expression, '(选课 OR 考试) AND NOT 取消');
+  const maximumLegacy = a.migrateKeywordExpression({ all: 'a '.repeat(250), any: 'b '.repeat(250), none: 'c '.repeat(250) });
+  assert.equal(a.compileQuery(maximumLegacy).valid, true, 'all three legacy fields can migrate at their old length limit');
+});
+
+test('migration preserves old complete-text truth table including empty groups', t => {
+  const { a } = setup(t);
+  for (const fields of [
+    { all: '选课 通知', any: '秋季 春季', none: '补选 取消' },
+    { all: '', any: '秋季 春季', none: '' },
+    { all: '', any: '', none: '补选 取消' },
+    { all: '', any: '', none: '' }
+  ]) {
+    const q = a.compileQuery(a.migrateKeywordExpression(fields));
+    assert.equal(q.valid, true);
+    const words = ['选课', '通知', '秋季', '春季', '补选', '取消'];
+    for (let bits = 0; bits < 64; bits++) {
+      const title = words.filter((_, i) => bits & (1 << i)).join(' ');
+      const group = s => s.split(/\s+/).filter(Boolean);
+      const expected = group(fields.all).every(t => title.includes(t)) &&
+        (!fields.any || group(fields.any).some(t => title.includes(t))) &&
+        !group(fields.none).some(t => title.includes(t));
+      assert.equal(a.matchEntry(a.makeEntry(1, 'ok', { title, bodyComplete: true }), q, 'full').hit, expected);
+    }
+  }
+});
+
+test('invalid expression blocks starting or copying but preserves cached results', async t => {
+  const { a, w, clock } = setup(t, { html: notice() });
+  a.bootstrap();
+  const root = w.document.getElementById('ucas-notice-nav-host').shadowRoot;
+  const input = root.querySelector('#expression');
+  input.value = '选课 AND (秋季 OR';
+  input.dispatchEvent(new w.Event('input'));
+  assert.equal(root.querySelector('#scan').disabled, true);
+  assert.equal(root.querySelector('#force').disabled, true);
+  assert.equal(root.querySelector('#copy').disabled, true);
+  assert.equal(input.getAttribute('aria-invalid'), 'true');
+  await clock.tickAsync(140);
+  assert.equal(root.querySelector('#hitBadge').textContent, '—');
+  assert.equal(a.state.results.size, 1);
+  await a.startScan(); // explicit guard also covers invocation outside the disabled button
+  assert.equal(a.scheduler.running, false);
+  input.value = '(选课 OR 考试) AND NOT 补选';
+  input.dispatchEvent(new w.Event('input'));
+  await clock.tickAsync(140);
+  assert.equal(root.querySelector('#scan').disabled, false);
+  assert.equal(root.querySelector('#copy').disabled, false);
+  assert.equal(root.querySelector('#hitBadge').textContent, '1');
+});
+
+test('operator buttons insert at the cursor and parentheses wrap selected expressions', t => {
+  const { a, w } = setup(t);
+  a.bootstrap();
+  const root = w.document.getElementById('ucas-notice-nav-host').shadowRoot;
+  const input = root.querySelector('#expression');
+  input.value = '秋季 OR 春季';
+  input.setSelectionRange(0, input.value.length);
+  root.querySelector('[data-insert="()"]').click();
+  assert.equal(input.value, '(秋季 OR 春季)');
+  input.setSelectionRange(input.value.length, input.value.length);
+  root.querySelector('[data-insert="AND"]').click();
+  assert.equal(input.value, '(秋季 OR 春季) AND ');
+  input.setRangeText('选课', input.selectionStart, input.selectionEnd, 'end');
+  input.setSelectionRange(0, input.value.length);
+  root.querySelector('[data-insert="NOT"]').click();
+  assert.equal(input.value, 'NOT ((秋季 OR 春季) AND 选课)');
+  assert.equal(a.loadConfig().cfg.ui.expression, input.value);
+  input.value = ''; input.setSelectionRange(0, 0);
+  root.querySelector('[data-insert="()"]').click();
+  assert.equal(input.value, '()');
+  assert.equal(input.selectionStart, 1);
+});
+
+function pointer(w, target, type, x, y, { id = 1, primary = true, button = 0 } = {}) {
+  const event = new w.MouseEvent(type, { bubbles: true, composed: true, cancelable: true, clientX: x, clientY: y, button });
+  Object.defineProperties(event, { pointerId: { value: id }, isPrimary: { value: primary } });
+  target.dispatchEvent(event);
+}
+
+test('collapse hides the entire panel and click restores it with filters unchanged', t => {
+  const { a, w } = setup(t);
+  a.bootstrap();
+  const root = w.document.getElementById('ucas-notice-nav-host').shadowRoot;
+  const panel = root.querySelector('#panel'), ball = root.querySelector('#floatBall');
+  root.querySelector('#expression').value = '选课 OR 考试';
+  root.querySelector('#collapse').click();
+  assert.equal(panel.hidden, true);
+  assert.equal(ball.hidden, false);
+  assert.equal(a.loadConfig().cfg.ui.collapsed, true);
+  assert.equal(root.activeElement, ball);
+  ball.click();
+  assert.equal(panel.hidden, false);
+  assert.equal(ball.hidden, true);
+  assert.equal(a.loadConfig().cfg.ui.collapsed, false);
+  assert.equal(root.querySelector('#expression').value, '选课 OR 考试');
+  assert.equal(root.activeElement, root.querySelector('#collapse'));
+  w.document.dispatchEvent(new w.KeyboardEvent('keydown', { key: 'n', altKey: true, bubbles: true }));
+  assert.equal(panel.hidden, true);
+  w.document.dispatchEvent(new w.KeyboardEvent('keydown', { key: 'n', altKey: true, bubbles: true }));
+  assert.equal(panel.hidden, false);
+});
+
+test('dragging saves position, suppresses its synthetic click, and allows the next tap', t => {
+  const local = memoryStorage(), { a, w } = setup(t, { local });
+  a.bootstrap();
+  const root = w.document.getElementById('ucas-notice-nav-host').shadowRoot, ball = root.querySelector('#floatBall');
+  root.querySelector('#collapse').click();
+  const before = { ...a.state.ballPosition };
+  pointer(w, ball, 'pointerdown', 960, 60);
+  pointer(w, ball, 'pointermove', 780, 200);
+  pointer(w, ball, 'pointerup', 780, 200);
+  ball.dispatchEvent(new w.MouseEvent('click', { bubbles: true, detail: 1 }));
+  assert.equal(root.querySelector('#panel').hidden, true);
+  assert.equal(a.state.ballPosition.x, before.x - 180);
+  assert.equal(a.state.ballPosition.y, before.y + 140);
+  assert.equal(a.loadConfig().cfg.ui.ballPosition.x, before.x - 180);
+  assert.equal(ball.classList.contains('dragging'), false);
+  const restored = setup(t, { local });
+  restored.a.bootstrap();
+  const restoredRoot = restored.w.document.getElementById('ucas-notice-nav-host').shadowRoot;
+  assert.equal(restoredRoot.querySelector('#floatBall').hidden, false);
+  assert.equal(restored.a.state.ballPosition.x, before.x - 180);
+  pointer(w, ball, 'pointerdown', 780, 200);
+  pointer(w, ball, 'pointerup', 781, 201);
+  ball.dispatchEvent(new w.MouseEvent('click', { bubbles: true, detail: 1 }));
+  assert.equal(root.querySelector('#panel').hidden, false);
+});
+
+test('ball stays on screen during dragging, viewport resize and keyboard movement', t => {
+  const { a, w } = setup(t);
+  a.bootstrap();
+  const root = w.document.getElementById('ucas-notice-nav-host').shadowRoot, ball = root.querySelector('#floatBall');
+  root.querySelector('#collapse').click();
+  pointer(w, ball, 'pointerdown', 960, 60);
+  pointer(w, ball, 'pointermove', 99999, 99999);
+  pointer(w, ball, 'pointerup', 99999, 99999);
+  assert.equal(a.state.ballPosition.x, w.innerWidth - 56 - 8);
+  assert.equal(a.state.ballPosition.y, w.innerHeight - 56 - 8);
+  w.innerWidth = 180; w.innerHeight = 220;
+  w.dispatchEvent(new w.Event('resize'));
+  assert.equal(a.state.ballPosition.x, 116);
+  assert.equal(a.state.ballPosition.y, 156);
+  ball.dispatchEvent(new w.KeyboardEvent('keydown', { key: 'ArrowLeft', bubbles: true }));
+  assert.equal(a.state.ballPosition.x, 104);
+  assert.equal(a.loadConfig().cfg.ui.ballPosition.x, 104);
+  pointer(w, ball, 'pointerdown', 100, 160);
+  pointer(w, ball, 'pointermove', -9999, -9999);
+  pointer(w, ball, 'pointerup', -9999, -9999);
+  assert.equal(a.state.ballPosition.x, 8);
+  assert.equal(a.state.ballPosition.y, 8);
+});
+
+test('cancelled and secondary pointers cannot leave the ball stuck or steal a drag', t => {
+  const { a, w } = setup(t);
+  a.bootstrap();
+  const root = w.document.getElementById('ucas-notice-nav-host').shadowRoot, ball = root.querySelector('#floatBall');
+  root.querySelector('#collapse').click();
+  const original = { ...a.state.ballPosition };
+  pointer(w, ball, 'pointerdown', 960, 60, { button: 2 });
+  pointer(w, ball, 'pointermove', 500, 200);
+  assert.equal(a.state.ballPosition.x, original.x);
+  pointer(w, ball, 'pointerdown', 960, 60);
+  pointer(w, ball, 'pointermove', 500, 200, { id: 2, primary: false });
+  assert.equal(a.state.ballPosition.x, original.x);
+  pointer(w, ball, 'pointermove', 500, 200);
+  pointer(w, ball, 'pointercancel', 500, 200);
+  assert.equal(a.state.ballPosition.x, original.x);
+  assert.equal(ball.classList.contains('dragging'), false);
+  ball.dispatchEvent(new w.MouseEvent('click', { bubbles: true, detail: 1 }));
+  assert.equal(root.querySelector('#panel').hidden, true);
+  ball.click(); // keyboard/assistive activation (detail=0)
+  assert.equal(root.querySelector('#panel').hidden, false);
+});
+
+test('collapsed panel keeps scanning and floating ball reflects running state', async t => {
+  const env = setup(t), { a, w, clock } = env;
+  a.bootstrap();
+  w.fetch = async () => response(notice());
+  const root = w.document.getElementById('ucas-notice-nav-host').shadowRoot, ball = root.querySelector('#floatBall');
+  const scan = a.runRangeScan(options(env, [21, 20]));
+  await clock.tickAsync(0);
+  root.querySelector('#collapse').click();
+  assert.equal(a.scheduler.running, true);
+  assert.equal(ball.dataset.state, 'running');
+  await clock.tickAsync(3000); await scan;
+  assert.equal(root.querySelector('#panel').hidden, true);
+  assert.equal(ball.dataset.state, 'idle');
+  assert.equal(a.state.results.get(20).status, 'ok');
 });
